@@ -5220,6 +5220,7 @@ function renderListPrepProjectList(){
         </div>
         <button class="btn amber small" style="margin-top:8px;" onclick="saveListPrepCloudSettings('${p.id}')">Save</button>
         <button class="btn outline small" style="margin-top:8px;" onclick="lpVerifySheet('${p.id}')">🔧 Verify / Set Up Sheet Now</button>
+        <button class="btn outline small" style="margin-top:8px;" onclick="lpTestPhotoUpload('${p.id}')">📷 Test Photo Upload Now</button>
         <div class="row" style="margin-top:8px;">
           <button class="btn outline small" onclick="openLpShareModal('${p.id}', false)">🔗 Share (Field Work)</button>
           <button class="btn outline small" onclick="lpManualRegisterProject('${p.id}')">📋 Register in Auto-Restore List</button>
@@ -5479,6 +5480,46 @@ function lpVerifySheet(id){
   }).catch(()=>{
     if(statusEl) statusEl.textContent = '⚠ Could not reach the server — check the Script URL and your connection.';
   });
+}
+function lpTestPhotoUpload(id){
+  const p = listPrepProjects.find(x=>x.id===id);
+  const statusEl = document.getElementById('lpPcStatus-'+id);
+  if(!p.sheetId || !p.appsScriptUrl){ if(statusEl) statusEl.textContent = '⚠ Set and save the Sheet ID and Script URL above first.'; return; }
+  // A tiny, self-contained test image — a 40x40 canvas square, no camera needed. This isolates
+  // the upload mechanism itself from anything about your actual camera or a real photo's size.
+  const canvas = document.createElement('canvas');
+  canvas.width = 40; canvas.height = 40;
+  const ctx = canvas.getContext('2d');
+  ctx.fillStyle = '#d98324'; ctx.fillRect(0,0,40,40);
+  const testDataUrl = canvas.toDataURL('image/jpeg', 0.8);
+  const testBase64 = testDataUrl.split(',')[1];
+  const photoTag = 'TEST' + Date.now();
+  const startedAt = Date.now();
+  if(statusEl) statusEl.textContent = 'Uploading a small test image… (0s)';
+  const tick = setInterval(()=>{
+    if(statusEl) statusEl.textContent = `Uploading a small test image… (${Math.round((Date.now()-startedAt)/1000)}s)`;
+  }, 1000);
+  fetch(p.appsScriptUrl, {
+    method:'POST', mode:'no-cors', headers:{'Content-Type':'text/plain;charset=utf-8'},
+    body: JSON.stringify({ action:'uploadListPrepPhotoAsync', photoTag, photo: testBase64, meterNo: 'TEST' })
+  }).catch(()=>{});
+  function poll(attempt){
+    jsonpRequest(p.appsScriptUrl, { action:'checkPhotoUploaded', sheetId:p.sheetId, photoTag }).then(res=>{
+      const elapsed = ((Date.now()-startedAt)/1000).toFixed(1);
+      if(res && res.done && res.url){
+        clearInterval(tick);
+        if(statusEl) statusEl.innerHTML = `✓ Test photo genuinely uploaded in ${elapsed}s.<br>File: <a href="${res.url}" target="_blank" style="word-break:break-all;">${res.url}</a>`;
+        return;
+      }
+      if(attempt < 15){ setTimeout(()=>poll(attempt+1), 2000); return; }
+      clearInterval(tick);
+      if(statusEl) statusEl.textContent = `⚠ Still not found after ${elapsed}s — the upload is genuinely failing or badly stuck. Check the Apps Script Executions log for lines starting "uploadListPrepPhotoAsync" to see the real reason.`;
+    }).catch(()=>{
+      if(attempt < 15) setTimeout(()=>poll(attempt+1), 2000);
+      else { clearInterval(tick); if(statusEl) statusEl.textContent = '⚠ Could not reach the server to check.'; }
+    });
+  }
+  setTimeout(()=>poll(1), 1500);
 }
 function lpManualRegisterProject(id){
   const p = listPrepProjects.find(x=>x.id===id);
