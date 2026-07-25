@@ -1602,6 +1602,30 @@ function doGet(e) {
   </div>
 </div>
 
+<!-- List Prep: save success — full confirmation, including any attached photo -->
+<div class="modal-backdrop" id="lpSaveSuccessModal">
+  <div class="modal-box">
+    <h3 style="color:var(--ok, #2e7d32);">✓ Saved to Google Sheet</h3>
+    <div id="lpSaveSuccessText" style="font-size:15px; line-height:1.7;"></div>
+    <button class="btn amber" style="margin-top:14px;" onclick="closeLpSaveSuccessModal()">OK</button>
+  </div>
+</div>
+
+<!-- List Prep: save failure — with manual Body Number fallback so the meter can still be
+     physically labeled and the number preserved exactly for when the network is back -->
+<div class="modal-backdrop" id="lpSaveFailureModal">
+  <div class="modal-box">
+    <h3 style="color:var(--warn, #b3261e);">⚠ Entry Failed to Register</h3>
+    <div id="lpSaveFailureText" style="font-size:14px; line-height:1.6;"></div>
+    <div id="lpSaveFailureBodyNoWrap" style="margin-top:12px;">
+      <label class="field-label">Allocate a manual Meter Body Number for now</label>
+      <div class="subtext" style="margin-top:0;">Write this same number on the meter body. It will upload exactly as typed once the network is back — it will not be swapped for a different one.</div>
+      <input type="text" id="lpSaveFailureBodyNo" placeholder="e.g. 47" inputmode="numeric">
+    </div>
+    <button class="btn amber" style="margin-top:14px;" onclick="lpConfirmManualBodyNo()">OK</button>
+  </div>
+</div>
+
 <!-- List Prep: Join via Code modal -->
 <div class="modal-backdrop" id="lpJoinModal">
   <div class="modal-box">
@@ -5468,6 +5492,10 @@ function doOpenListPrepProject(id){
   resetListPrepFormFully();
   renderLpFilterChips();
   renderLpRecordsTable();
+  const isFresh = (p.listMode || 'fresh') === 'fresh';
+  const bodyNoEl = document.getElementById('lpBodyNo');
+  bodyNoEl.disabled = isFresh;
+  bodyNoEl.placeholder = isFresh ? 'Allocated automatically after saving' : 'e.g. 4471829';
   document.getElementById('lpPausedBanner').style.display = p.accessPaused ? 'block' : 'none';
   const saveBtn = document.getElementById('lpSaveEntryBtn');
   saveBtn.disabled = !!p.accessPaused;
@@ -5662,13 +5690,18 @@ function saveListPrepEntry(){
   }).catch(()=>{ syncListPrepEntry(p, rec, []); });
 }
 function syncListPrepEntry(p, rec, photoB64){
-  if(!p.appsScriptUrl || !p.sheetId){ rec.cloudStatus = 'Not configured'; rec.syncFailed = true; renderLpRecordsTable(); return; }
+  if(!p.appsScriptUrl || !p.sheetId){
+    rec.cloudStatus = 'Not configured'; rec.syncFailed = true; renderLpRecordsTable();
+    showLpSaveFailure(p, rec, 'This list has no Sheet ID / Script URL saved yet.');
+    return;
+  }
   function confirmSaveLanded(attempt){
     jsonpRequest(p.appsScriptUrl, { action:'checkListEntrySaved', sheetId:p.sheetId, sr:rec.sr, meterNo:rec.meterNo, device:p.device }).then(res=>{
       if(res && res.found){
         rec.cloudStatus = `✓ Synced${rec.bodyNo ? ' — Body No. '+rec.bodyNo : ''}`;
         rec.syncFailed = false;
         renderLpRecordsTable();
+        showLpSaveSuccess(rec.meterNo, rec.bodyNo);
       } else if(attempt < 6){
         rec.cloudStatus = `Still confirming… (${attempt}/6 — a photo can genuinely take a while)`;
         renderLpRecordsTable();
@@ -5677,10 +5710,14 @@ function syncListPrepEntry(p, rec, photoB64){
         rec.cloudStatus = '⚠ Not found in the Sheet after ~30s — tap 🔍 Check Again, or Retry below';
         rec.syncFailed = true;
         renderLpRecordsTable();
+        showLpSaveFailure(p, rec, 'The entry was sent, but could not be confirmed in the Sheet after about 30 seconds.');
       }
     }).catch(()=>{
       if(attempt < 6) setTimeout(()=>confirmSaveLanded(attempt+1), 5000);
-      else { rec.cloudStatus = '⚠ Could not confirm — tap 🔍 Check Again, or Retry below'; rec.syncFailed = true; renderLpRecordsTable(); }
+      else {
+        rec.cloudStatus = '⚠ Could not confirm — tap 🔍 Check Again, or Retry below'; rec.syncFailed = true; renderLpRecordsTable();
+        showLpSaveFailure(p, rec, 'Could not reach the server to confirm the save.');
+      }
     });
   }
   function proceedToSave(){
@@ -5698,7 +5735,10 @@ function syncListPrepEntry(p, rec, photoB64){
         renderLpRecordsTable();
         setTimeout(()=>confirmSaveLanded(1), 2000);
       })
-      .catch(()=>{ rec.cloudStatus = 'Send failed — tap Retry below'; rec.syncFailed = true; renderLpRecordsTable(); });
+      .catch(()=>{
+        rec.cloudStatus = 'Send failed — tap Retry below'; rec.syncFailed = true; renderLpRecordsTable();
+        showLpSaveFailure(p, rec, 'The connection dropped while sending.');
+      });
   }
   // Blocking, by deliberate choice: the save only proceeds once this check succeeds. A failed check
   // stops the entry here rather than saving it unverified — stricter, but that's what was chosen.
@@ -5710,6 +5750,7 @@ function syncListPrepEntry(p, rec, photoB64){
       rec.cloudStatus = '⚠ ' + ((check&&check.message)||'Meter Body Number check failed — tap Retry below.');
       rec.syncFailed = true;
       renderLpRecordsTable();
+      showLpSaveFailure(p, rec, (check&&check.message) || 'Meter Body Number could not be checked.');
       return;
     }
     rec.bodyNo = check.bodyNo;
@@ -5722,8 +5763,42 @@ function syncListPrepEntry(p, rec, photoB64){
     rec.cloudStatus = '⚠ Could not reach the server to check Meter Body Number — tap Retry below.';
     rec.syncFailed = true;
     renderLpRecordsTable();
+    showLpSaveFailure(p, rec, 'Could not reach the server.');
   });
 }
+/* ---------- List Prep save result popups ---------- */
+let lpFailurePendingRec = null;
+function showLpSaveSuccess(meterNo, bodyNo){
+  document.getElementById('lpSaveSuccessText').innerHTML =
+    `Your Meter Scan <b>${meterNo}</b> has been synced/uploaded in Google Sheet with Meter Body Number <b>${bodyNo || '(none)'}</b>.` +
+    (bodyNo ? `<br><br>Write <b>${bodyNo}</b> on the meter body now.` : '');
+  document.getElementById('lpSaveSuccessModal').classList.add('open');
+}
+function closeLpSaveSuccessModal(){
+  document.getElementById('lpSaveSuccessModal').classList.remove('open');
+}
+function showLpSaveFailure(p, rec, message){
+  lpFailurePendingRec = { projId: p.id, sr: rec.sr };
+  document.getElementById('lpSaveFailureText').textContent =
+    `Meter No. ${rec.meterNo} — ${message} It has NOT reached the Sheet yet. It's still saved on this device and can be retried once the connection is better.`;
+  const bodyNoInput = document.getElementById('lpSaveFailureBodyNo');
+  bodyNoInput.value = rec.bodyNo || '';
+  document.getElementById('lpSaveFailureModal').classList.add('open');
+}
+function lpConfirmManualBodyNo(){
+  if(lpFailurePendingRec){
+    const p = listPrepProjects.find(x=>x.id===lpFailurePendingRec.projId);
+    const rec = p && p.records.find(r=>String(r.sr)===String(lpFailurePendingRec.sr));
+    if(rec){
+      const typed = document.getElementById('lpSaveFailureBodyNo').value.trim();
+      if(typed) rec.bodyNo = typed; // exact number preserved — retry will check it, never replace it
+      renderLpRecordsTable();
+    }
+  }
+  document.getElementById('lpSaveFailureModal').classList.remove('open');
+  lpFailurePendingRec = null;
+}
+
 function checkAgainLpEntry(projId, sr){
   const p = listPrepProjects.find(x=>x.id===projId);
   if(!p) return;
