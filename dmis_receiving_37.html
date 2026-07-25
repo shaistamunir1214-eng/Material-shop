@@ -1,3 +1,4 @@
+
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -1057,12 +1058,73 @@ function appendToPrintSheet(ss, data) {
   sheet.getRange(idRow, 6, 1, 2).merge().setValue('Name: ____________________');
 }
 
-// Meter Body Number is a plain field, saved exactly as typed with saveListEntry — no separate
-// check, no auto-numbering, no uniqueness enforcement. Whatever the user enters is what's stored.
-// Lets the client warn before pointing a new List Prep list at a Sheet ID that's already in use
-// by a Receiving project — sharing is allowed by design (List Prep's tabs are named distinctly so
-// they never collide), but it should be a conscious choice, not something that happens silently
-// and then looks confusing later when someone finds Receiving's tabs sitting there unexplained.
+// Meter Body Number — restored with auto-generation and uniqueness, scoped per Sheet (per list),
+// shared across every user on it. Locked against two people claiming the same number at once.
+// Mode-aware: Fresh List auto-generates when left blank; Re-Listing leaves it genuinely blank when
+// left blank, since a meter already tagged in the field has a real number we simply don't know yet
+// — inventing one would be worse than having none. Either mode still checks a TYPED number for
+// duplicates. Zero-padded (01, 02...) when auto-generated.
+function padBodyNo(n) {
+  var s = String(n);
+  return s.length < 2 ? ('0' + s) : s;
+}
+function safeFormatDate(v) {
+  try {
+    var d = (v instanceof Date) ? v : new Date(v);
+    if (isNaN(d.getTime())) return '(unknown time)';
+    return Utilities.formatDate(d, Session.getScriptTimeZone(), 'dd/MM/yyyy HH:mm');
+  } catch (e) { return '(unknown time)'; }
+}
+function checkOrAllocateBodyNo(sheetId, bodyNo, listMode, meterNo) {
+  var lock = LockService.getScriptLock();
+  try { lock.waitLock(15000); } catch (e) { return { status: 'error', message: 'Server busy — try again in a moment.' }; }
+  try {
+    var ss = SpreadsheetApp.openById(sheetId);
+    var sheet = ss.getSheetByName('Dispatch-Scrap List');
+    var requested = (bodyNo && String(bodyNo).trim() !== '') ? String(bodyNo).trim() : '';
+    var isRelisting = listMode === 'relisting';
+    if (!sheet) {
+      var bn0 = requested ? padBodyNo(Number(requested) || requested) : (isRelisting ? '' : padBodyNo(1));
+      return { status: 'ok', bodyNo: bn0 };
+    }
+    var vals = sheet.getDataRange().getValues();
+    var used = {};
+    var maxNo = 0;
+    var conflictMeter = '', conflictType = '', conflictWhen = '';
+    var meterDuplicate = null;
+    for (var i = 1; i < vals.length; i++) {
+      var bn = vals[i][12]; // Meter Body Number column
+      if (bn !== '' && bn !== null && bn !== undefined && !isNaN(Number(bn))) {
+        var n = Number(bn);
+        used[n] = true;
+        if (n > maxNo) maxNo = n;
+        if (requested && String(n) === String(Number(requested))) {
+          conflictMeter = vals[i][2]; conflictType = vals[i][3];
+          conflictWhen = safeFormatDate(vals[i][0]);
+        }
+      }
+      if (meterNo && !meterDuplicate && String(vals[i][2]).trim().toUpperCase() === String(meterNo).trim().toUpperCase()) {
+        meterDuplicate = { device: vals[i][10], when: safeFormatDate(vals[i][0]) };
+      }
+    }
+    if (requested) {
+      var reqNum = Number(requested);
+      if (!isNaN(reqNum) && used[reqNum]) {
+        return { status: 'error', message: 'Meter Body Number ' + padBodyNo(reqNum) + ' is already used — against Meter No. ' +
+          conflictMeter + ' (' + conflictType + '), scanned ' + conflictWhen + '. Enter a different number.' };
+      }
+      return { status: 'ok', bodyNo: padBodyNo(reqNum), meterDuplicate: meterDuplicate };
+    }
+    if (isRelisting) return { status: 'ok', bodyNo: '', meterDuplicate: meterDuplicate };
+    for (var candidate = 1; candidate <= maxNo + 1; candidate++) {
+      if (!used[candidate]) return { status: 'ok', bodyNo: padBodyNo(candidate), meterDuplicate: meterDuplicate };
+    }
+    return { status: 'ok', bodyNo: padBodyNo(maxNo + 1), meterDuplicate: meterDuplicate };
+  } catch (err) {
+    return { status: 'error', message: 'Could not check Meter Body Number: ' + err.message };
+  } finally { lock.releaseLock(); }
+}
+
 function checkSheetInUse(sheetId) {
   try {
     var ss = SpreadsheetApp.openById(sheetId);
@@ -1202,6 +1264,8 @@ function doGet(e) {
     result = checkSheetInUse(e.parameter.sheetId);
   } else if (action === 'initListPrepSheet') {
     result = initListPrepSheet(e.parameter.sheetId);
+  } else if (action === 'checkOrAllocateBodyNo') {
+    result = checkOrAllocateBodyNo(e.parameter.sheetId, e.parameter.bodyNo, e.parameter.listMode, e.parameter.meterNo);
   } else {
     var sheet = ss.getSheetByName('DMIS Receiving');
     var rows = [];
@@ -1511,8 +1575,9 @@ function doGet(e) {
       <button data-val="fresh" data-default="true">Fresh List — classifying meters for the first time</button>
       <button data-val="relisting">Re-Listing — meters already tagged in the field</button>
     </div>
-    <div class="subtext" style="margin-top:4px;">Meter Body Number is always typed in by whoever's entering data — nothing is auto-numbered.
-      Re-Listing is for meters already tagged in the field; Fresh List is for classifying them for the first time.</div>
+    <div class="subtext" style="margin-top:4px;">Fresh List auto-numbers each meter's Body Number if you leave it blank.
+      Re-Listing leaves it blank by default instead — for meters already tagged in the field with a real
+      number this app doesn't know yet. Either way, typing a number is always checked against duplicates.</div>
     <label class="field-label">Google Sheet ID for this list (optional — link later if unsure)</label>
     <div class="qr-field-row">
       <input type="text" id="lpNpSheetId" placeholder="A Sheet ID — can be its own, or shared with a project">
@@ -5618,21 +5683,46 @@ function syncListPrepEntry(p, rec, photoB64){
       else { rec.cloudStatus = '⚠ Could not confirm — tap 🔍 Check Again, or Retry below'; rec.syncFailed = true; renderLpRecordsTable(); }
     });
   }
-  const payload = {
-    action:'saveListEntry', sheetId:p.sheetId, sr:rec.sr, meterNo:rec.meterNo, bodyNo:rec.bodyNo, meterType:rec.meterType,
-    alias:rec.alias, category:rec.category,
-    yearMfg:rec.yearMfg, status:rec.status, lotNo:rec.lotNo, refMatch:rec.refMatch, remarks:rec.remarks,
-    project:p.name, device:p.device, photo: photoB64 && photoB64.length ? photoB64 : undefined,
-  };
-  rec.cloudStatus = 'Sending…';
+  function proceedToSave(){
+    const payload = {
+      action:'saveListEntry', sheetId:p.sheetId, sr:rec.sr, meterNo:rec.meterNo, bodyNo:rec.bodyNo, meterType:rec.meterType,
+      alias:rec.alias, category:rec.category,
+      yearMfg:rec.yearMfg, status:rec.status, lotNo:rec.lotNo, refMatch:rec.refMatch, remarks:rec.remarks,
+      project:p.name, device:p.device, photo: photoB64 && photoB64.length ? photoB64 : undefined,
+    };
+    rec.cloudStatus = 'Sending…';
+    renderLpRecordsTable();
+    fetch(p.appsScriptUrl, { method:'POST', mode:'no-cors', headers:{'Content-Type':'text/plain;charset=utf-8'}, body: JSON.stringify(payload) })
+      .then(()=>{
+        rec.cloudStatus = 'Confirming it reached the Sheet…';
+        renderLpRecordsTable();
+        setTimeout(()=>confirmSaveLanded(1), 2000);
+      })
+      .catch(()=>{ rec.cloudStatus = 'Send failed — tap Retry below'; rec.syncFailed = true; renderLpRecordsTable(); });
+  }
+  // Blocking, by deliberate choice: the save only proceeds once this check succeeds. A failed check
+  // stops the entry here rather than saving it unverified — stricter, but that's what was chosen.
+  rec.cloudStatus = 'Checking Meter Body Number…';
   renderLpRecordsTable();
-  fetch(p.appsScriptUrl, { method:'POST', mode:'no-cors', headers:{'Content-Type':'text/plain;charset=utf-8'}, body: JSON.stringify(payload) })
-    .then(()=>{
-      rec.cloudStatus = 'Confirming it reached the Sheet…';
+  jsonpRequest(p.appsScriptUrl, { action:'checkOrAllocateBodyNo', sheetId:p.sheetId, bodyNo: (rec.bodyNo||'').trim(),
+    listMode: p.listMode || 'fresh', meterNo: rec.meterNo }).then(check=>{
+    if(!check || check.status!=='ok'){
+      rec.cloudStatus = '⚠ ' + ((check&&check.message)||'Meter Body Number check failed — tap Retry below.');
+      rec.syncFailed = true;
       renderLpRecordsTable();
-      setTimeout(()=>confirmSaveLanded(1), 2000);
-    })
-    .catch(()=>{ rec.cloudStatus = 'Send failed — tap Retry below'; rec.syncFailed = true; renderLpRecordsTable(); });
+      return;
+    }
+    rec.bodyNo = check.bodyNo;
+    if(check.meterDuplicate){
+      rec.cloudStatus = `⚠ Meter No. ${rec.meterNo} was already scanned by "${check.meterDuplicate.device}" on ${check.meterDuplicate.when} — saving anyway`;
+      renderLpRecordsTable();
+    }
+    proceedToSave();
+  }).catch(()=>{
+    rec.cloudStatus = '⚠ Could not reach the server to check Meter Body Number — tap Retry below.';
+    rec.syncFailed = true;
+    renderLpRecordsTable();
+  });
 }
 function checkAgainLpEntry(projId, sr){
   const p = listPrepProjects.find(x=>x.id===projId);
