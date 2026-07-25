@@ -5794,7 +5794,7 @@ function startLpPhotoUpload(dataUrl, idx){
   // which is exactly what the working diagnostic test used and what actually succeeded.
   const rawFallback = dataUrl.split(',')[1];
   const compressionTimeout = new Promise(resolve => setTimeout(()=>resolve(rawFallback), 5000));
-  Promise.race([compressImageForUpload(dataUrl, 1100, 0.6), compressionTimeout]).then(compressed=>{
+  Promise.race([compressImageForUpload(dataUrl, 700, 0.4), compressionTimeout]).then(compressed=>{
     const toSend = compressed || rawFallback;
     fetch(p.appsScriptUrl, {
       method:'POST', mode:'no-cors', headers:{'Content-Type':'text/plain;charset=utf-8'},
@@ -6049,7 +6049,7 @@ function retryLpPendingPhoto(projId, sr){
     const photoTag = 'pt' + Date.now() + Math.floor(Math.random()*100000) + '_' + i;
     const rawFallback = rec.photoDataList[i].split(',')[1];
     const compressionTimeout = new Promise(resolve => setTimeout(()=>resolve(rawFallback), 5000));
-    return Promise.race([compressImageForUpload(rec.photoDataList[i], 1100, 0.6), compressionTimeout]).then(compressed=>
+    return Promise.race([compressImageForUpload(rec.photoDataList[i], 700, 0.4), compressionTimeout]).then(compressed=>
       new Promise(resolve=>{
         fetch(p.appsScriptUrl, {
           method:'POST', mode:'no-cors', headers:{'Content-Type':'text/plain;charset=utf-8'},
