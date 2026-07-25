@@ -834,25 +834,52 @@ function doPostInner(e) {
   }
 
   if (data.action === 'saveListEntry') {
-    var lpSheet = ss.getSheetByName('Dispatch-Scrap List');
-    if (!lpSheet) {
-      lpSheet = ss.insertSheet('Dispatch-Scrap List');
-      lpSheet.appendRow(['Timestamp','Sr No','Meter No','Meter Type','Year of Manufacturing',
-        'Declared Status','Lot No','Reference Match','Remarks','List','Device','Photo URLs','Meter Body Number']);
-      lpSheet.getRange(1,1,1,13).setFontWeight('bold').setBackground('#eef1f3');
+    var lpLock = LockService.getScriptLock();
+    try { lpLock.waitLock(15000); } catch (e) {
+      return ContentService.createTextOutput(JSON.stringify({status:'error', message:'Server busy — try again.'}))
+        .setMimeType(ContentService.MimeType.JSON);
     }
-    var lpPhotoUrls = uploadPhotos(data.photo, 'listprep');
-    lpSheet.appendRow([
-      new Date(), data.sr, data.meterNo, data.meterType, data.yearMfg || '',
-      data.status || '', data.lotNo || '', data.refMatch || '', data.remarks || '',
-      data.project, data.device, lpPhotoUrls, data.bodyNo || ''
-    ]);
+    try {
+      var lpSheet = ss.getSheetByName('Dispatch-Scrap List');
+      if (!lpSheet) {
+        lpSheet = ss.insertSheet('Dispatch-Scrap List');
+        lpSheet.appendRow(['Timestamp','Sr No','Meter No','Meter Type','Year of Manufacturing',
+          'Declared Status','Lot No','Reference Match','Remarks','List','Device','Photo URLs','Meter Body Number']);
+        lpSheet.getRange(1,1,1,13).setFontWeight('bold').setBackground('#eef1f3');
+      }
+      // Write the row FIRST — with its Body Number already in place — so a confirmation check right
+      // after this returns can find it immediately. Photo upload is the slow, variable step (Drive,
+      // not Sheets); doing it first was what made every save wait on the photo before anything was
+      // even visible. flush() commits this write for real before the photo step even starts.
+      var newRow = lpSheet.getLastRow() + 1;
+      lpSheet.getRange(newRow, 1, 1, 13).setValues([[
+        new Date(), data.sr, data.meterNo, data.meterType, data.yearMfg || '',
+        data.status || '', data.lotNo || '', data.refMatch || '', data.remarks || '',
+        data.project, data.device, data.photoUrls || '', data.bodyNo || ''
+      ]]);
+      SpreadsheetApp.flush();
+    } finally { lpLock.releaseLock(); }
+    // Photo URLs, if the photo was already uploaded separately before Save was pressed, are already
+    // written above — nothing more to do. This fallback only fires if raw base64 photo data arrives
+    // instead (an older/different caller), in which case it's uploaded here the old, slower way.
+    if (!data.photoUrls && data.photo) {
+      var lpPhotoUrls = uploadPhotos(data.photo, 'listprep');
+      if (lpPhotoUrls) {
+        lpSheet.getRange(newRow, 12).setValue(lpPhotoUrls);
+      }
+    }
     try {
       appendToListPrepPrintSheet(ss, data);
     } catch (printErr) {
       Logger.log('List For Print write failed: ' + printErr.message);
     }
     return ContentService.createTextOutput(JSON.stringify({status:'ok'}))
+      .setMimeType(ContentService.MimeType.JSON);
+  }
+
+  if (data.action === 'uploadListPrepPhotoAsync') {
+    var upResult = uploadListPrepPhotoAsync(data.photoTag, data.photo, data.meterNo);
+    return ContentService.createTextOutput(JSON.stringify(upResult))
       .setMimeType(ContentService.MimeType.JSON);
   }
 
@@ -1075,6 +1102,65 @@ function safeFormatDate(v) {
     return Utilities.formatDate(d, Session.getScriptTimeZone(), 'dd/MM/yyyy HH:mm');
   } catch (e) { return '(unknown time)'; }
 }
+// List Prep async photo upload — deliberately separate from Receiving's photo-upload code (not
+// reused, not refactored) specifically so nothing here can risk Receiving's already-working path.
+// Upload begins the instant a photo is captured, tagged with a client-generated ID unique to that
+// photo. Save Entry never waits on this directly — it either has a finished URL already, or it
+// doesn't, and either way the save proceeds without blocking on the photo.
+function getListPrepPhotoFolder() {
+  var masterName = 'List Prep Photos';
+  var folders = DriveApp.getFoldersByName(masterName);
+  return folders.hasNext() ? folders.next() : DriveApp.createFolder(masterName);
+}
+function uploadListPrepPhotoAsync(photoTag, base64, meterNo) {
+  try {
+    var folder = getListPrepPhotoFolder();
+    var blob = Utilities.newBlob(Utilities.base64Decode(base64), 'image/jpeg',
+      'listprep_' + (meterNo || 'meter') + '_' + photoTag + '.jpg');
+    var file = folder.createFile(blob);
+    file.setSharing(DriveApp.Access.ANYONE_WITH_LINK, DriveApp.Permission.VIEW);
+    return { status: 'ok' };
+  } catch (err) {
+    return { status: 'error', message: err.message };
+  }
+}
+function checkPhotoUploaded(photoTag) {
+  try {
+    var folder = getListPrepPhotoFolder();
+    var files = folder.getFiles();
+    while (files.hasNext()) {
+      var f = files.next();
+      if (f.getName().indexOf(photoTag) !== -1) {
+        return { status: 'ok', done: true, url: f.getUrl() };
+      }
+    }
+    return { status: 'ok', done: false };
+  } catch (err) {
+    return { status: 'error', message: err.message, done: false };
+  }
+}
+// Patches an already-saved row's Photo URLs column after the fact — used when a photo was held
+// locally (upload was too slow, user chose to save without waiting) and later retried successfully.
+function patchListEntryPhoto(sheetId, sr, meterNo, device, photoUrls) {
+  try {
+    var ss = SpreadsheetApp.openById(sheetId);
+    var sheet = ss.getSheetByName('Dispatch-Scrap List');
+    if (!sheet) return { status: 'error', message: 'List sheet not found.' };
+    var vals = sheet.getDataRange().getValues();
+    for (var i = 1; i < vals.length; i++) {
+      if (String(vals[i][1]) === String(sr) &&
+          String(vals[i][2]).trim().toUpperCase() === String(meterNo).trim().toUpperCase() &&
+          String(vals[i][10]) === String(device)) {
+        sheet.getRange(i + 1, 12).setValue(photoUrls);
+        return { status: 'ok' };
+      }
+    }
+    return { status: 'error', message: 'Could not find that entry to attach the photo to.' };
+  } catch (err) {
+    return { status: 'error', message: err.message };
+  }
+}
+
 function checkOrAllocateBodyNo(sheetId, bodyNo, listMode, meterNo) {
   var lock = LockService.getScriptLock();
   try { lock.waitLock(15000); } catch (e) { return { status: 'error', message: 'Server busy — try again in a moment.' }; }
@@ -1266,6 +1352,10 @@ function doGet(e) {
     result = initListPrepSheet(e.parameter.sheetId);
   } else if (action === 'checkOrAllocateBodyNo') {
     result = checkOrAllocateBodyNo(e.parameter.sheetId, e.parameter.bodyNo, e.parameter.listMode, e.parameter.meterNo);
+  } else if (action === 'checkPhotoUploaded') {
+    result = checkPhotoUploaded(e.parameter.photoTag);
+  } else if (action === 'patchListEntryPhoto') {
+    result = patchListEntryPhoto(e.parameter.sheetId, e.parameter.sr, e.parameter.meterNo, e.parameter.device, e.parameter.photoUrls);
   } else {
     var sheet = ss.getSheetByName('DMIS Receiving');
     var rows = [];
@@ -3196,6 +3286,7 @@ let listPrepProjects = [];
 let activeListPrepProjectId = null;
 let lpSelectedCategory='', lpSelectedAlias='', lpSelectedVariant='';
 let lpPhotos = [];
+let lpPhotoUploads = []; // parallel to lpPhotos, same index — {photoTag, status:'uploading'|'done'|'held', url}
 let lpQrScanner = null;
 let lpCameraStream = null;
 let lpScannerGotDecode = false;
@@ -4492,7 +4583,9 @@ function removePhoto(mode, idx){
   const entry = PHOTO_MODE_MAP[mode];
   if(!entry) return;
   entry.list().splice(idx, 1);
+  if(mode === 'lpphoto') lpPhotoUploads.splice(idx, 1);
   renderPhotoThumbs(entry.list(), entry.containerId, mode);
+  if(mode === 'lpphoto') renderLpPhotoStatuses();
 }
 function capturePhoto(){
   const video = document.getElementById('camVideo');
@@ -5622,9 +5715,73 @@ function captureListPrepPhoto(){
   const dataUrl = canvas.toDataURL('image/jpeg', 0.85);
   lpPhotos.push(dataUrl);
   renderPhotoThumbs(lpPhotos, 'lpPhotoThumb', 'lpphoto');
+  startLpPhotoUpload(dataUrl, lpPhotos.length - 1);
   closeListPrepCamera();
 }
 PHOTO_MODE_MAP.lpphoto = { list: () => lpPhotos, containerId: 'lpPhotoThumb' };
+function startLpPhotoUpload(dataUrl, idx){
+  const p = getActiveListPrepProject();
+  if(!p || !p.appsScriptUrl){ lpPhotoUploads[idx] = { status: 'held' }; return; }
+  const photoTag = 'pt' + Date.now() + Math.floor(Math.random()*100000);
+  lpPhotoUploads[idx] = { photoTag, status: 'uploading', startedAt: Date.now() };
+  renderLpPhotoStatuses();
+  compressImageForUpload(dataUrl, 1100, 0.6).then(compressed=>{
+    fetch(p.appsScriptUrl, {
+      method:'POST', mode:'no-cors', headers:{'Content-Type':'text/plain;charset=utf-8'},
+      body: JSON.stringify({ action:'uploadListPrepPhotoAsync', photoTag, photo: compressed, meterNo: document.getElementById('lpMeterNo').value.trim() })
+    }).catch(()=>{}); // failure surfaces through polling timing out, not here
+    pollLpPhotoUpload(idx, photoTag, 1);
+  });
+}
+function pollLpPhotoUpload(idx, photoTag, attempt){
+  const p = getActiveListPrepProject();
+  if(!p || !lpPhotoUploads[idx] || lpPhotoUploads[idx].photoTag !== photoTag) return; // photo was removed or replaced
+  jsonpRequest(p.appsScriptUrl, { action:'checkPhotoUploaded', sheetId:p.sheetId, photoTag }).then(res=>{
+    if(!lpPhotoUploads[idx] || lpPhotoUploads[idx].photoTag !== photoTag) return;
+    if(res && res.done && res.url){
+      lpPhotoUploads[idx].status = 'done';
+      lpPhotoUploads[idx].url = res.url;
+      renderLpPhotoStatuses();
+      return;
+    }
+    const elapsed = Date.now() - lpPhotoUploads[idx].startedAt;
+    if(elapsed > 30000){
+      lpPhotoUploads[idx].status = 'slow';
+      renderLpPhotoStatuses();
+      if(confirm('This photo is taking longer than 30 seconds to upload. Hold it on this device and try again later when the connection is better?\n\nTap OK to hold it locally — you can still save this entry now, and re-upload the photo any time.\n\nTap Cancel to keep waiting.')){
+        lpPhotoUploads[idx].status = 'held';
+        renderLpPhotoStatuses();
+      } else {
+        lpPhotoUploads[idx].startedAt = Date.now(); // give it another 30s window
+        setTimeout(()=>pollLpPhotoUpload(idx, photoTag, attempt+1), 3000);
+      }
+      return;
+    }
+    setTimeout(()=>pollLpPhotoUpload(idx, photoTag, attempt+1), 3000);
+  }).catch(()=>{
+    setTimeout(()=>pollLpPhotoUpload(idx, photoTag, attempt+1), 3000);
+  });
+}
+function renderLpPhotoStatuses(){
+  const el = document.getElementById('lpPhotoThumb');
+  if(!el) return;
+  [...el.querySelectorAll('.thumb-wrap')].forEach((wrap, i)=>{
+    let badge = wrap.querySelector('.lp-photo-status');
+    if(!badge){
+      badge = document.createElement('div');
+      badge.className = 'lp-photo-status';
+      badge.style.cssText = 'font-size:10px; text-align:center; margin-top:2px; font-weight:700;';
+      wrap.appendChild(badge);
+    }
+    const st = lpPhotoUploads[i];
+    if(!st) { badge.textContent = ''; return; }
+    if(st.status==='uploading') { badge.textContent = 'Uploading…'; badge.style.color = 'var(--muted)'; }
+    else if(st.status==='done') { badge.textContent = '✓ Uploaded'; badge.style.color = 'var(--ok, #2e7d32)'; }
+    else if(st.status==='slow') { badge.textContent = 'Taking a while…'; badge.style.color = 'var(--warn, #b3261e)'; }
+    else if(st.status==='held') { badge.textContent = '⏸ Held — will retry'; badge.style.color = 'var(--warn, #b3261e)'; }
+  });
+}
+
 
 /* ---------- Save / sync entry ---------- */
 function resetListPrepForm(clearMeterNo){
@@ -5676,20 +5833,24 @@ function saveListPrepEntry(){
     refMatch,
     remarks: document.getElementById('lpRemarks').value.trim(),
     cloudStatus: 'Preparing…',
-    photoDataList: [...lpPhotos], photoUrls: [],
+    // Snapshot of upload STATE, not raw photo data — the photo(s) were already being uploaded the
+    // instant they were captured, well before Save was ever pressed. What matters now is only:
+    // did they finish? photoDataList is kept too, purely so a manual retry has the original image
+    // to re-attempt with if a photo ends up held.
+    photoDataList: [...lpPhotos],
+    photoUploads: lpPhotoUploads.map(u => u ? {...u} : null),
   };
   p.records.push(rec);
   renderListPrepProjectList();
   renderLpFilterChips();
   renderLpRecordsTable();
   resetListPrepForm(true);
+  lpPhotoUploads = [];
   playBeep(1200,120);
 
-  compressList(rec.photoDataList, 1100, 0.6).then(photoB64=>{
-    syncListPrepEntry(p, rec, photoB64);
-  }).catch(()=>{ syncListPrepEntry(p, rec, []); });
+  syncListPrepEntry(p, rec);
 }
-function syncListPrepEntry(p, rec, photoB64){
+function syncListPrepEntry(p, rec){
   if(!p.appsScriptUrl || !p.sheetId){
     rec.cloudStatus = 'Not configured'; rec.syncFailed = true; renderLpRecordsTable();
     showLpSaveFailure(p, rec, 'This list has no Sheet ID / Script URL saved yet.');
@@ -5702,18 +5863,18 @@ function syncListPrepEntry(p, rec, photoB64){
         rec.syncFailed = false;
         renderLpRecordsTable();
         showLpSaveSuccess(rec.meterNo, rec.bodyNo);
-      } else if(attempt < 6){
-        rec.cloudStatus = `Still confirming… (${attempt}/6 — a photo can genuinely take a while)`;
+      } else if(attempt < 8){
+        rec.cloudStatus = `Still confirming… (${attempt}/8)`;
         renderLpRecordsTable();
-        setTimeout(()=>confirmSaveLanded(attempt+1), 5000);
+        setTimeout(()=>confirmSaveLanded(attempt+1), 2000);
       } else {
-        rec.cloudStatus = '⚠ Not found in the Sheet after ~30s — tap 🔍 Check Again, or Retry below';
+        rec.cloudStatus = '⚠ Not found in the Sheet after ~16s — tap 🔍 Check Again, or Retry below';
         rec.syncFailed = true;
         renderLpRecordsTable();
-        showLpSaveFailure(p, rec, 'The entry was sent, but could not be confirmed in the Sheet after about 30 seconds.');
+        showLpSaveFailure(p, rec, 'The entry was sent, but could not be confirmed in the Sheet after about 16 seconds.');
       }
     }).catch(()=>{
-      if(attempt < 6) setTimeout(()=>confirmSaveLanded(attempt+1), 5000);
+      if(attempt < 8) setTimeout(()=>confirmSaveLanded(attempt+1), 2000);
       else {
         rec.cloudStatus = '⚠ Could not confirm — tap 🔍 Check Again, or Retry below'; rec.syncFailed = true; renderLpRecordsTable();
         showLpSaveFailure(p, rec, 'Could not reach the server to confirm the save.');
@@ -5721,11 +5882,17 @@ function syncListPrepEntry(p, rec, photoB64){
     });
   }
   function proceedToSave(){
+    // Never waits on the photo here — either it's already uploaded (use the URL, tiny payload)
+    // or it isn't yet, in which case the save proceeds without it and the photo attaches later.
+    const uploads = rec.photoUploads || [];
+    const doneUrls = uploads.filter(u => u && u.status === 'done' && u.url).map(u => u.url);
+    const hasPending = uploads.some(u => u && u.status !== 'done');
+    rec.hasPendingPhoto = hasPending;
     const payload = {
       action:'saveListEntry', sheetId:p.sheetId, sr:rec.sr, meterNo:rec.meterNo, bodyNo:rec.bodyNo, meterType:rec.meterType,
       alias:rec.alias, category:rec.category,
       yearMfg:rec.yearMfg, status:rec.status, lotNo:rec.lotNo, refMatch:rec.refMatch, remarks:rec.remarks,
-      project:p.name, device:p.device, photo: photoB64 && photoB64.length ? photoB64 : undefined,
+      project:p.name, device:p.device, photoUrls: doneUrls.length ? doneUrls.join('\n') : undefined,
     };
     rec.cloudStatus = 'Sending…';
     renderLpRecordsTable();
@@ -5733,7 +5900,7 @@ function syncListPrepEntry(p, rec, photoB64){
       .then(()=>{
         rec.cloudStatus = 'Confirming it reached the Sheet…';
         renderLpRecordsTable();
-        setTimeout(()=>confirmSaveLanded(1), 2000);
+        setTimeout(()=>confirmSaveLanded(1), 800);
       })
       .catch(()=>{
         rec.cloudStatus = 'Send failed — tap Retry below'; rec.syncFailed = true; renderLpRecordsTable();
@@ -5799,6 +5966,54 @@ function lpConfirmManualBodyNo(){
   lpFailurePendingRec = null;
 }
 
+function retryLpPendingPhoto(projId, sr){
+  const p = listPrepProjects.find(x=>x.id===projId);
+  if(!p) return;
+  const rec = p.records.find(r=>String(r.sr)===String(sr));
+  if(!rec || !rec.photoDataList || !rec.photoDataList.length) return;
+  const pendingIdx = (rec.photoUploads||[]).map((u,i)=>({u,i})).filter(x=>!x.u || x.u.status!=='done').map(x=>x.i);
+  if(!pendingIdx.length){ rec.hasPendingPhoto = false; renderLpRecordsTable(); return; }
+  rec.cloudStatus = (rec.cloudStatus||'') + ' — retrying photo…';
+  renderLpRecordsTable();
+  Promise.all(pendingIdx.map(i=>{
+    const photoTag = 'pt' + Date.now() + Math.floor(Math.random()*100000) + '_' + i;
+    return compressImageForUpload(rec.photoDataList[i], 1100, 0.6).then(compressed=>
+      new Promise(resolve=>{
+        fetch(p.appsScriptUrl, {
+          method:'POST', mode:'no-cors', headers:{'Content-Type':'text/plain;charset=utf-8'},
+          body: JSON.stringify({ action:'uploadListPrepPhotoAsync', photoTag, photo: compressed, meterNo: rec.meterNo })
+        }).catch(()=>{});
+        function poll(attempt){
+          jsonpRequest(p.appsScriptUrl, { action:'checkPhotoUploaded', sheetId:p.sheetId, photoTag }).then(res=>{
+            if(res && res.done && res.url) resolve(res.url);
+            else if(attempt < 10) setTimeout(()=>poll(attempt+1), 3000);
+            else resolve(null);
+          }).catch(()=>{ if(attempt < 10) setTimeout(()=>poll(attempt+1), 3000); else resolve(null); });
+        }
+        poll(1);
+      })
+    );
+  })).then(urls=>{
+    const goodUrls = urls.filter(Boolean);
+    if(!goodUrls.length){
+      rec.cloudStatus = '⚠ Photo retry failed — still held, try again later';
+      renderLpRecordsTable();
+      return;
+    }
+    jsonpRequest(p.appsScriptUrl, { action:'patchListEntryPhoto', sheetId:p.sheetId, sr:rec.sr, meterNo:rec.meterNo, device:p.device, photoUrls: goodUrls.join('\n') }).then(res=>{
+      if(res && res.status==='ok'){
+        rec.hasPendingPhoto = false;
+        rec.cloudStatus = `✓ Synced${rec.bodyNo ? ' — Body No. '+rec.bodyNo : ''} — photo attached`;
+      } else {
+        rec.cloudStatus = '⚠ Photo uploaded but could not attach to the entry — ' + ((res&&res.message)||'unknown error');
+      }
+      renderLpRecordsTable();
+    }).catch(()=>{
+      rec.cloudStatus = '⚠ Photo uploaded but could not reach the server to attach it — try again';
+      renderLpRecordsTable();
+    });
+  });
+}
 function checkAgainLpEntry(projId, sr){
   const p = listPrepProjects.find(x=>x.id===projId);
   if(!p) return;
@@ -5835,7 +6050,9 @@ function retryLpEntry(projId, sr){
   lpSelectedCategory = rec.category || ''; lpSelectedAlias = rec.alias || ''; lpSelectedVariant = rec.variant || '';
   renderLpCategoryChips();
   lpPhotos = rec.photoDataList ? [...rec.photoDataList] : [];
+  lpPhotoUploads = rec.photoUploads ? rec.photoUploads.map(u => u ? {...u} : null) : [];
   renderPhotoThumbs(lpPhotos, 'lpPhotoThumb', 'lpphoto');
+  renderLpPhotoStatuses();
   const statusGroup = document.getElementById('lpStatus');
   [...statusGroup.children].forEach(b=>{
     applyToggleColor(b, b.getAttribute('data-val')===rec.status ? classifyToggleColor(statusGroup, rec.status) : null);
@@ -5875,7 +6092,10 @@ function renderLpRecordsTable(){
           <button class="pill-btn secondary" style="padding:4px 6px; margin-right:4px;" title="Check Again (verify without resending)" onclick="checkAgainLpEntry('${p.id}',${r.sr})">🔍</button>
           <button class="pill-btn secondary" style="padding:4px 6px; margin-right:4px;" title="Retry" onclick="retryLpEntry('${p.id}',${r.sr})">🔄</button>
           <button class="pill-btn secondary" style="color:var(--warn); border-color:var(--warn); padding:4px 6px;" title="Cancel" onclick="cancelLpEntry('${p.id}',${r.sr})">✕</button>
-        ` : `<button class="pill-btn secondary" style="color:var(--warn); border-color:var(--warn); padding:4px 8px;" onclick="deleteLpRecord('${p.id}',${r.sr})">✕</button>`}
+        ` : (r.hasPendingPhoto ? `
+          <button class="pill-btn secondary" style="padding:4px 6px; margin-right:4px;" title="Retry uploading the held photo" onclick="retryLpPendingPhoto('${p.id}',${r.sr})">📷 Upload Photo</button>
+          <button class="pill-btn secondary" style="color:var(--warn); border-color:var(--warn); padding:4px 8px;" onclick="deleteLpRecord('${p.id}',${r.sr})">✕</button>
+        ` : `<button class="pill-btn secondary" style="color:var(--warn); border-color:var(--warn); padding:4px 8px;" onclick="deleteLpRecord('${p.id}',${r.sr})">✕</button>`)}
       </td>
     </tr>`).join('') || '<tr><td colspan="10" style="color:var(--muted);">No entries yet.</td></tr>';
 }
