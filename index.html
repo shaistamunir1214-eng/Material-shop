@@ -5789,10 +5789,16 @@ function startLpPhotoUpload(dataUrl, idx){
   const photoTag = 'pt' + Date.now() + Math.floor(Math.random()*100000);
   lpPhotoUploads[idx] = { photoTag, status: 'uploading', startedAt: Date.now() };
   renderLpPhotoStatuses();
-  compressImageForUpload(dataUrl, 1100, 0.6).then(compressed=>{
+  // Compression should never be able to silently block the upload forever if it hangs for any
+  // reason — race it against a timeout and fall back to the original (already-JPEG) photo data,
+  // which is exactly what the working diagnostic test used and what actually succeeded.
+  const rawFallback = dataUrl.split(',')[1];
+  const compressionTimeout = new Promise(resolve => setTimeout(()=>resolve(rawFallback), 5000));
+  Promise.race([compressImageForUpload(dataUrl, 1100, 0.6), compressionTimeout]).then(compressed=>{
+    const toSend = compressed || rawFallback;
     fetch(p.appsScriptUrl, {
       method:'POST', mode:'no-cors', headers:{'Content-Type':'text/plain;charset=utf-8'},
-      body: JSON.stringify({ action:'uploadListPrepPhotoAsync', photoTag, photo: compressed, meterNo: document.getElementById('lpMeterNo').value.trim() })
+      body: JSON.stringify({ action:'uploadListPrepPhotoAsync', photoTag, photo: toSend, meterNo: document.getElementById('lpMeterNo').value.trim() })
     }).catch(()=>{}); // failure surfaces through polling timing out, not here
     pollLpPhotoUpload(idx, photoTag, 1);
   });
@@ -6041,11 +6047,13 @@ function retryLpPendingPhoto(projId, sr){
   renderLpRecordsTable();
   Promise.all(pendingIdx.map(i=>{
     const photoTag = 'pt' + Date.now() + Math.floor(Math.random()*100000) + '_' + i;
-    return compressImageForUpload(rec.photoDataList[i], 1100, 0.6).then(compressed=>
+    const rawFallback = rec.photoDataList[i].split(',')[1];
+    const compressionTimeout = new Promise(resolve => setTimeout(()=>resolve(rawFallback), 5000));
+    return Promise.race([compressImageForUpload(rec.photoDataList[i], 1100, 0.6), compressionTimeout]).then(compressed=>
       new Promise(resolve=>{
         fetch(p.appsScriptUrl, {
           method:'POST', mode:'no-cors', headers:{'Content-Type':'text/plain;charset=utf-8'},
-          body: JSON.stringify({ action:'uploadListPrepPhotoAsync', photoTag, photo: compressed, meterNo: rec.meterNo })
+          body: JSON.stringify({ action:'uploadListPrepPhotoAsync', photoTag, photo: compressed || rawFallback, meterNo: rec.meterNo })
         }).catch(()=>{});
         function poll(attempt){
           jsonpRequest(p.appsScriptUrl, { action:'checkPhotoUploaded', sheetId:p.sheetId, photoTag }).then(res=>{
