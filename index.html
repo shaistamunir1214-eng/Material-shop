@@ -1108,16 +1108,17 @@ function safeFormatDate(v) {
 // photo. Save Entry never waits on this directly — it either has a finished URL already, or it
 // doesn't, and either way the save proceeds without blocking on the photo.
 function getListPrepPhotoFolder() {
-  var masterName = 'List Prep Photos';
-  var lock = LockService.getScriptLock();
-  try { lock.waitLock(10000); } catch (e) { /* proceed anyway — better than throwing here */ }
-  try {
-    var folders = DriveApp.getFoldersByName(masterName);
-    if (folders.hasNext()) return folders.next();
-    return DriveApp.createFolder(masterName);
-  } finally {
-    try { lock.releaseLock(); } catch (e) {}
+  var props = PropertiesService.getScriptProperties();
+  var folderId = props.getProperty('LIST_PREP_PHOTO_FOLDER_ID');
+  if (folderId) {
+    try { return DriveApp.getFolderById(folderId); }
+    catch (e) { /* folder was deleted/moved out from under us — fall through and recreate below */ }
   }
+  var masterName = 'List Prep Photos';
+  var folders = DriveApp.getFoldersByName(masterName);
+  var folder = folders.hasNext() ? folders.next() : DriveApp.createFolder(masterName);
+  props.setProperty('LIST_PREP_PHOTO_FOLDER_ID', folder.getId());
+  return folder;
 }
 function uploadListPrepPhotoAsync(photoTag, base64, meterNo) {
   try {
@@ -1332,7 +1333,7 @@ function appendToListPrepPrintSheet(ss, data) {
 }
 
 function doGet(e) {
-  var ENTRIES_SCRIPT_VERSION = 'v2026-07-25-d'; // bump this whenever the Entries Script changes —
+  var ENTRIES_SCRIPT_VERSION = 'v2026-07-25-e'; // bump this whenever the Entries Script changes —
     // visiting the Web App URL directly in a browser (no params needed) shows this immediately,
     // so "did you actually redeploy the latest version" never has to be a guessing game again.
   if (!e || !e.parameter || !e.parameter.sheetId) {
