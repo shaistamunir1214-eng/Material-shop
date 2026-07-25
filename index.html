@@ -849,9 +849,10 @@ function doPostInner(e) {
         .setMimeType(ContentService.MimeType.JSON);
     }
     try {
-      var lpSheet = ss.getSheetByName('Dispatch-Scrap List');
+      var lpSheetName = 'Dispatch-Scrap List-' + data.project;
+      var lpSheet = ss.getSheetByName(lpSheetName);
       if (!lpSheet) {
-        lpSheet = ss.insertSheet('Dispatch-Scrap List');
+        lpSheet = ss.insertSheet(lpSheetName);
         lpSheet.appendRow(['Timestamp','Sr No','Meter No','Meter Type','Year of Manufacturing',
           'Declared Status','Lot No','Reference Match','Remarks','List','Device','Photo URLs','Meter Body Number']);
         lpSheet.getRange(1,1,1,13).setFontWeight('bold').setBackground('#eef1f3');
@@ -860,7 +861,7 @@ function doPostInner(e) {
       // with everything already in place. A photo-including save genuinely takes longer this way,
       // but there's nothing left to go wrong except the one thing that's always worked reliably:
       // sending data to the server and waiting for it to finish.
-      var lpPhotoUrls = uploadPhotos(data.photo, 'listprep');
+      var lpPhotoUrls = uploadListPrepPhotos(data.photo, data.project, data.meterNo);
       lpSheet.appendRow([
         new Date(), data.sr, data.meterNo, data.meterType, data.yearMfg || '',
         data.status || '', data.lotNo || '', data.refMatch || '', data.remarks || '',
@@ -1100,12 +1101,12 @@ function safeFormatDate(v) {
 // Upload begins the instant a photo is captured, tagged with a client-generated ID unique to that
 // photo. Save Entry never waits on this directly — it either has a finished URL already, or it
 // doesn't, and either way the save proceeds without blocking on the photo.
-function checkOrAllocateBodyNo(sheetId, bodyNo, listMode, meterNo) {
+function checkOrAllocateBodyNo(sheetId, bodyNo, listMode, meterNo, projectName) {
   var lock = LockService.getScriptLock();
   try { lock.waitLock(15000); } catch (e) { return { status: 'error', message: 'Server busy — try again in a moment.' }; }
   try {
     var ss = SpreadsheetApp.openById(sheetId);
-    var sheet = ss.getSheetByName('Dispatch-Scrap List');
+    var sheet = ss.getSheetByName('Dispatch-Scrap List-' + projectName);
     var requested = (bodyNo && String(bodyNo).trim() !== '') ? String(bodyNo).trim() : '';
     var isRelisting = listMode === 'relisting';
     if (!sheet) {
@@ -1118,6 +1119,9 @@ function checkOrAllocateBodyNo(sheetId, bodyNo, listMode, meterNo) {
     var conflictMeter = '', conflictType = '', conflictWhen = '';
     var meterDuplicate = null;
     for (var i = 1; i < vals.length; i++) {
+      // Both Body Number allocation AND Meter No. duplicate detection are now naturally scoped to
+      // this project's own tab — a direct, deliberate consequence of each project having its own
+      // raw-data sheet. A meter re-scanned under a DIFFERENT project will no longer be caught here.
       var bn = vals[i][12]; // Meter Body Number column
       if (bn !== '' && bn !== null && bn !== undefined && !isNaN(Number(bn))) {
         var n = Number(bn);
@@ -1135,7 +1139,7 @@ function checkOrAllocateBodyNo(sheetId, bodyNo, listMode, meterNo) {
     if (requested) {
       var reqNum = Number(requested);
       if (!isNaN(reqNum) && used[reqNum]) {
-        return { status: 'error', message: 'Meter Body Number ' + padBodyNo(reqNum) + ' is already used — against Meter No. ' +
+        return { status: 'error', message: 'Meter Body Number ' + padBodyNo(reqNum) + ' is already used in this list — against Meter No. ' +
           conflictMeter + ' (' + conflictType + '), scanned ' + conflictWhen + '. Enter a different number.' };
       }
       return { status: 'ok', bodyNo: padBodyNo(reqNum), meterDuplicate: meterDuplicate };
@@ -1154,7 +1158,7 @@ function checkSheetInUse(sheetId) {
   try {
     var ss = SpreadsheetApp.openById(sheetId);
     var hasReceiving = !!ss.getSheetByName('DMIS Receiving');
-    var hasListPrep = !!ss.getSheetByName('Dispatch-Scrap List');
+    var hasListPrep = ss.getSheets().some(function(s){ return s.getName().indexOf('Dispatch-Scrap List-') === 0; });
     return { status: 'ok', hasReceiving: hasReceiving, hasListPrep: hasListPrep };
   } catch (err) {
     return { status: 'error', message: 'Could not check this Sheet: ' + err.message };
@@ -1165,13 +1169,14 @@ function checkSheetInUse(sheetId) {
 // there left no trace and no way to tell "never tried" apart from "tried and failed." Calling this
 // at setup time gives an immediate, honest yes/no on whether this Sheet is actually reachable and
 // writable, before a single real entry is ever at risk.
-function initListPrepSheet(sheetId) {
+function initListPrepSheet(sheetId, projectName) {
   try {
     var ss = SpreadsheetApp.openById(sheetId);
-    var lpSheet = ss.getSheetByName('Dispatch-Scrap List');
+    var tabName = 'Dispatch-Scrap List-' + (projectName || '');
+    var lpSheet = ss.getSheetByName(tabName);
     var created = false;
     if (!lpSheet) {
-      lpSheet = ss.insertSheet('Dispatch-Scrap List');
+      lpSheet = ss.insertSheet(tabName);
       lpSheet.appendRow(['Timestamp','Sr No','Meter No','Meter Type','Year of Manufacturing',
         'Declared Status','Lot No','Reference Match','Remarks','List','Device','Photo URLs','Meter Body Number']);
       lpSheet.getRange(1,1,1,13).setFontWeight('bold').setBackground('#eef1f3');
@@ -1187,10 +1192,10 @@ function initListPrepSheet(sheetId) {
 // for a URL — which means the client can NEVER read whether that POST actually succeeded. This is
 // the real, separate confirmation step: a lightweight read-only check, called a moment after saving,
 // to see whether a matching row genuinely landed in the Sheet.
-function checkListEntrySaved(sheetId, sr, meterNo, device) {
+function checkListEntrySaved(sheetId, sr, meterNo, device, projectName) {
   try {
     var ss = SpreadsheetApp.openById(sheetId);
-    var sheet = ss.getSheetByName('Dispatch-Scrap List');
+    var sheet = ss.getSheetByName('Dispatch-Scrap List-' + (projectName || ''));
     if (!sheet) return { status: 'ok', found: false };
     var vals = sheet.getDataRange().getValues();
     for (var i = 1; i < vals.length; i++) {
@@ -1203,6 +1208,39 @@ function checkListEntrySaved(sheetId, sr, meterNo, device) {
     return { status: 'ok', found: false };
   } catch (err) {
     return { status: 'error', message: 'Could not confirm: ' + err.message, found: false };
+  }
+}
+
+// List Prep photos — deliberately separate from Receiving's folder structure entirely, not shared,
+// not nested inside it. One top-level folder for all List Prep photos, one sub-folder per List
+// Project (named after the list), and inside that, one sub-folder per Meter Number — so every
+// photo of the same meter across any scans lands together in one place.
+function uploadListPrepPhotos(base64Array, projectName, meterNo) {
+  if (!base64Array || !base64Array.length) return '';
+  try {
+    var masterFolders = DriveApp.getFoldersByName('List Prep Photos');
+    var masterFolder = masterFolders.hasNext() ? masterFolders.next() : DriveApp.createFolder('List Prep Photos');
+
+    var safeProjectName = String(projectName || 'Unnamed List').replace(/[\/\\:*?"<>|]/g, '-');
+    var projectFolders = masterFolder.getFoldersByName(safeProjectName);
+    var projectFolder = projectFolders.hasNext() ? projectFolders.next() : masterFolder.createFolder(safeProjectName);
+
+    var safeMeterNo = String(meterNo || 'Unknown Meter').replace(/[\/\\:*?"<>|]/g, '-');
+    var meterFolders = projectFolder.getFoldersByName(safeMeterNo);
+    var meterFolder = meterFolders.hasNext() ? meterFolders.next() : projectFolder.createFolder(safeMeterNo);
+
+    var urls = [];
+    base64Array.forEach(function(b64, idx) {
+      if (!b64) return;
+      var blob = Utilities.newBlob(Utilities.base64Decode(b64), 'image/jpeg',
+        'listprep_' + new Date().getTime() + '_' + idx + '.jpg');
+      var file = meterFolder.createFile(blob);
+      file.setSharing(DriveApp.Access.ANYONE_WITH_LINK, DriveApp.Permission.VIEW);
+      urls.push(file.getUrl());
+    });
+    return urls.join('\n');
+  } catch (err) {
+    return 'Upload error: ' + err.message;
   }
 }
 
@@ -1284,13 +1322,13 @@ function doGet(e) {
     }
     result = { meters: meters };
   } else if (action === 'checkListEntrySaved') {
-    result = checkListEntrySaved(e.parameter.sheetId, e.parameter.sr, e.parameter.meterNo, e.parameter.device);
+    result = checkListEntrySaved(e.parameter.sheetId, e.parameter.sr, e.parameter.meterNo, e.parameter.device, e.parameter.project);
   } else if (action === 'checkSheetInUse') {
     result = checkSheetInUse(e.parameter.sheetId);
   } else if (action === 'initListPrepSheet') {
-    result = initListPrepSheet(e.parameter.sheetId);
+    result = initListPrepSheet(e.parameter.sheetId, e.parameter.project);
   } else if (action === 'checkOrAllocateBodyNo') {
-    result = checkOrAllocateBodyNo(e.parameter.sheetId, e.parameter.bodyNo, e.parameter.listMode, e.parameter.meterNo);
+    result = checkOrAllocateBodyNo(e.parameter.sheetId, e.parameter.bodyNo, e.parameter.listMode, e.parameter.meterNo, e.parameter.project);
   } else {
     var sheet = ss.getSheetByName('DMIS Receiving');
     var rows = [];
@@ -5068,7 +5106,7 @@ function createListPrepProject(){
     // The real, immediate test — actually create and confirm the Dispatch-Scrap List tab right now,
     // rather than only finding out this Sheet was unreachable after a save silently failed later.
     if(sheetId && appsScriptUrl){
-      jsonpRequest(appsScriptUrl, { action:'initListPrepSheet', sheetId }).then(res=>{
+      jsonpRequest(appsScriptUrl, { action:'initListPrepSheet', sheetId, project: name }).then(res=>{
         if(!res || res.status!=='ok'){
           alert(`⚠ Could not set up "${name}"'s Sheet: ${(res&&res.message)||'unknown error'}\n\nThis means saves to this list will fail. Check the Sheet ID is correct and that this Apps Script's account has edit access to it.`);
         }
@@ -5386,14 +5424,14 @@ function lpVerifySheet(id){
   const statusEl = document.getElementById('lpPcStatus-'+id);
   if(!p.sheetId || !p.appsScriptUrl){ if(statusEl) statusEl.textContent = '⚠ Set and save the Sheet ID and Script URL above first.'; return; }
   if(statusEl) statusEl.textContent = 'Checking the Sheet is reachable and setting up its tab…';
-  jsonpRequest(p.appsScriptUrl, { action:'initListPrepSheet', sheetId:p.sheetId }).then(res=>{
+  jsonpRequest(p.appsScriptUrl, { action:'initListPrepSheet', sheetId:p.sheetId, project:p.name }).then(res=>{
     if(!res || res.status!=='ok'){
       if(statusEl) statusEl.textContent = `⚠ ${(res&&res.message)||'Could not set up this Sheet — unknown error.'}`;
       return;
     }
     if(statusEl) statusEl.textContent = res.created
-      ? `✓ "Dispatch-Scrap List" tab created in "${res.sheetName}" — this list is ready to save to.`
-      : `✓ Confirmed — "Dispatch-Scrap List" already exists in "${res.sheetName}" and is reachable.`;
+      ? `✓ "Dispatch-Scrap List-${p.name}" tab created in "${res.sheetName}" — this list is ready to save to.`
+      : `✓ Confirmed — "Dispatch-Scrap List-${p.name}" already exists in "${res.sheetName}" and is reachable.`;
   }).catch(()=>{
     if(statusEl) statusEl.textContent = '⚠ Could not reach the server — check the Script URL and your connection.';
   });
@@ -5727,7 +5765,7 @@ function syncListPrepEntry(p, rec, photoB64){
     return;
   }
   function confirmSaveLanded(attempt){
-    jsonpRequest(p.appsScriptUrl, { action:'checkListEntrySaved', sheetId:p.sheetId, sr:rec.sr, meterNo:rec.meterNo, device:p.device }).then(res=>{
+    jsonpRequest(p.appsScriptUrl, { action:'checkListEntrySaved', sheetId:p.sheetId, sr:rec.sr, meterNo:rec.meterNo, device:p.device, project:p.name }).then(res=>{
       if(res && res.found){
         rec.cloudStatus = `✓ Synced${rec.bodyNo ? ' — Body No. '+rec.bodyNo : ''}`;
         rec.syncFailed = false;
@@ -5776,7 +5814,7 @@ function syncListPrepEntry(p, rec, photoB64){
   rec.cloudStatus = 'Checking Meter Body Number…';
   renderLpRecordsTable();
   jsonpRequest(p.appsScriptUrl, { action:'checkOrAllocateBodyNo', sheetId:p.sheetId, bodyNo: (rec.bodyNo||'').trim(),
-    listMode: p.listMode || 'fresh', meterNo: rec.meterNo }).then(check=>{
+    listMode: p.listMode || 'fresh', meterNo: rec.meterNo, project: p.name }).then(check=>{
     if(!check || check.status!=='ok'){
       rec.cloudStatus = '⚠ ' + ((check&&check.message)||'Meter Body Number check failed — tap Retry below.');
       rec.syncFailed = true;
@@ -5837,7 +5875,7 @@ function checkAgainLpEntry(projId, sr){
   if(!rec) return;
   rec.cloudStatus = 'Checking the Sheet directly…';
   renderLpRecordsTable();
-  jsonpRequest(p.appsScriptUrl, { action:'checkListEntrySaved', sheetId:p.sheetId, sr:rec.sr, meterNo:rec.meterNo, device:p.device }).then(res=>{
+  jsonpRequest(p.appsScriptUrl, { action:'checkListEntrySaved', sheetId:p.sheetId, sr:rec.sr, meterNo:rec.meterNo, device:p.device, project:p.name }).then(res=>{
     if(res && res.found){
       rec.cloudStatus = `✓ Actually already synced${rec.bodyNo ? ' — Body No. '+rec.bodyNo : ''} (the earlier "failed" message was wrong — sorry about that)`;
       rec.syncFailed = false;
