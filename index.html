@@ -1121,13 +1121,19 @@ function getListPrepPhotoFolder() {
 }
 function uploadListPrepPhotoAsync(photoTag, base64, meterNo) {
   try {
+    if (!base64) {
+      Logger.log('uploadListPrepPhotoAsync: no photo data received for tag ' + photoTag);
+      return { status: 'error', message: 'No photo data received.' };
+    }
     var folder = getListPrepPhotoFolder();
     var blob = Utilities.newBlob(Utilities.base64Decode(base64), 'image/jpeg',
       'listprep_' + (meterNo || 'meter') + '_' + photoTag + '.jpg');
     var file = folder.createFile(blob);
     file.setSharing(DriveApp.Access.ANYONE_WITH_LINK, DriveApp.Permission.VIEW);
+    Logger.log('uploadListPrepPhotoAsync: OK, tag=' + photoTag + ', fileId=' + file.getId());
     return { status: 'ok' };
   } catch (err) {
+    Logger.log('uploadListPrepPhotoAsync FAILED for tag ' + photoTag + ': ' + err.message + '\n' + (err.stack || ''));
     return { status: 'error', message: err.message };
   }
 }
@@ -1326,7 +1332,7 @@ function appendToListPrepPrintSheet(ss, data) {
 }
 
 function doGet(e) {
-  var ENTRIES_SCRIPT_VERSION = 'v2026-07-25-c'; // bump this whenever the Entries Script changes —
+  var ENTRIES_SCRIPT_VERSION = 'v2026-07-25-d'; // bump this whenever the Entries Script changes —
     // visiting the Web App URL directly in a browser (no params needed) shows this immediately,
     // so "did you actually redeploy the latest version" never has to be a guessing game again.
   if (!e || !e.parameter || !e.parameter.sheetId) {
