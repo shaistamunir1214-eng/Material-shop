@@ -1138,15 +1138,33 @@ function uploadListPrepPhotoAsync(photoTag, base64, meterNo) {
     return { status: 'error', message: err.message };
   }
 }
+// Diagnostic-only twin of the function above, callable via GET so the response can actually be
+// read by the client directly — the real upload has to be a blind POST (photos are too large for
+// a URL), which is exactly why failures there have been invisible without digging through logs.
+// This is only for the small built-in test image, which is small enough to fit as a GET parameter.
+function testPhotoUploadSync(photoTag, base64, meterNo) {
+  try {
+    if (!base64) return { status: 'error', message: 'No photo data received by the server at all.' };
+    var folder = getListPrepPhotoFolder();
+    var blob = Utilities.newBlob(Utilities.base64Decode(base64), 'image/jpeg',
+      'listprep_TEST_' + photoTag + '.jpg');
+    var file = folder.createFile(blob);
+    file.setSharing(DriveApp.Access.ANYONE_WITH_LINK, DriveApp.Permission.VIEW);
+    return { status: 'ok', url: file.getUrl(), fileId: file.getId() };
+  } catch (err) {
+    return { status: 'error', message: err.message, stack: (err.stack || '').substring(0, 500) };
+  }
+}
 function checkPhotoUploaded(photoTag) {
   try {
     var folder = getListPrepPhotoFolder();
-    var files = folder.getFiles();
-    while (files.hasNext()) {
+    // Drive's own search index, not a manual scan through every file — this stays fast no matter
+    // how many photos have piled up in this folder over time, unlike iterating folder.getFiles().
+    var query = "'" + folder.getId() + "' in parents and title contains '" + photoTag + "' and trashed = false";
+    var files = DriveApp.searchFiles(query);
+    if (files.hasNext()) {
       var f = files.next();
-      if (f.getName().indexOf(photoTag) !== -1) {
-        return { status: 'ok', done: true, url: f.getUrl() };
-      }
+      return { status: 'ok', done: true, url: f.getUrl() };
     }
     return { status: 'ok', done: false };
   } catch (err) {
@@ -1333,7 +1351,7 @@ function appendToListPrepPrintSheet(ss, data) {
 }
 
 function doGet(e) {
-  var ENTRIES_SCRIPT_VERSION = 'v2026-07-25-e'; // bump this whenever the Entries Script changes —
+  var ENTRIES_SCRIPT_VERSION = 'v2026-07-25-g'; // bump this whenever the Entries Script changes —
     // visiting the Web App URL directly in a browser (no params needed) shows this immediately,
     // so "did you actually redeploy the latest version" never has to be a guessing game again.
   if (!e || !e.parameter || !e.parameter.sheetId) {
@@ -1370,6 +1388,8 @@ function doGet(e) {
     result = checkPhotoUploaded(e.parameter.photoTag);
   } else if (action === 'patchListEntryPhoto') {
     result = patchListEntryPhoto(e.parameter.sheetId, e.parameter.sr, e.parameter.meterNo, e.parameter.device, e.parameter.photoUrls);
+  } else if (action === 'testPhotoUploadSync') {
+    result = testPhotoUploadSync(e.parameter.photoTag, e.parameter.photo, e.parameter.meterNo);
   } else {
     var sheet = ss.getSheetByName('DMIS Receiving');
     var rows = [];
@@ -5485,8 +5505,9 @@ function lpTestPhotoUpload(id){
   const p = listPrepProjects.find(x=>x.id===id);
   const statusEl = document.getElementById('lpPcStatus-'+id);
   if(!p.sheetId || !p.appsScriptUrl){ if(statusEl) statusEl.textContent = '⚠ Set and save the Sheet ID and Script URL above first.'; return; }
-  // A tiny, self-contained test image — a 40x40 canvas square, no camera needed. This isolates
-  // the upload mechanism itself from anything about your actual camera or a real photo's size.
+  // A tiny, self-contained test image — a 40x40 canvas square, no camera needed. Small enough to
+  // send as a GET request, unlike a real photo — which means the response is actually readable
+  // this time, with the real error message if something fails, instead of blind polling.
   const canvas = document.createElement('canvas');
   canvas.width = 40; canvas.height = 40;
   const ctx = canvas.getContext('2d');
@@ -5495,31 +5516,19 @@ function lpTestPhotoUpload(id){
   const testBase64 = testDataUrl.split(',')[1];
   const photoTag = 'TEST' + Date.now();
   const startedAt = Date.now();
-  if(statusEl) statusEl.textContent = 'Uploading a small test image… (0s)';
-  const tick = setInterval(()=>{
-    if(statusEl) statusEl.textContent = `Uploading a small test image… (${Math.round((Date.now()-startedAt)/1000)}s)`;
-  }, 1000);
-  fetch(p.appsScriptUrl, {
-    method:'POST', mode:'no-cors', headers:{'Content-Type':'text/plain;charset=utf-8'},
-    body: JSON.stringify({ action:'uploadListPrepPhotoAsync', photoTag, photo: testBase64, meterNo: 'TEST' })
-  }).catch(()=>{});
-  function poll(attempt){
-    jsonpRequest(p.appsScriptUrl, { action:'checkPhotoUploaded', sheetId:p.sheetId, photoTag }).then(res=>{
-      const elapsed = ((Date.now()-startedAt)/1000).toFixed(1);
-      if(res && res.done && res.url){
-        clearInterval(tick);
-        if(statusEl) statusEl.innerHTML = `✓ Test photo genuinely uploaded in ${elapsed}s.<br>File: <a href="${res.url}" target="_blank" style="word-break:break-all;">${res.url}</a>`;
-        return;
-      }
-      if(attempt < 15){ setTimeout(()=>poll(attempt+1), 2000); return; }
-      clearInterval(tick);
-      if(statusEl) statusEl.textContent = `⚠ Still not found after ${elapsed}s — the upload is genuinely failing or badly stuck. Check the Apps Script Executions log for lines starting "uploadListPrepPhotoAsync" to see the real reason.`;
-    }).catch(()=>{
-      if(attempt < 15) setTimeout(()=>poll(attempt+1), 2000);
-      else { clearInterval(tick); if(statusEl) statusEl.textContent = '⚠ Could not reach the server to check.'; }
-    });
-  }
-  setTimeout(()=>poll(1), 1500);
+  if(statusEl) statusEl.textContent = 'Testing — this will show the real result directly…';
+  jsonpRequest(p.appsScriptUrl, { action:'testPhotoUploadSync', sheetId:p.sheetId, photoTag, photo: testBase64, meterNo: 'TEST' }).then(res=>{
+    const elapsed = ((Date.now()-startedAt)/1000).toFixed(1);
+    if(res && res.status==='ok' && res.url){
+      if(statusEl) statusEl.innerHTML = `✓ Genuinely uploaded in ${elapsed}s.<br>File: <a href="${res.url}" target="_blank" style="word-break:break-all;">${res.url}</a>`;
+    } else {
+      if(statusEl) statusEl.innerHTML = `⚠ Real server error after ${elapsed}s:<br><b>${(res&&res.message)||'Unknown — no message returned at all.'}</b>` +
+        (res && res.stack ? `<br><span style="font-size:11px; color:var(--muted);">${res.stack}</span>` : '');
+    }
+  }).catch(()=>{
+    const elapsed = ((Date.now()-startedAt)/1000).toFixed(1);
+    if(statusEl) statusEl.textContent = `⚠ Could not reach the server at all after ${elapsed}s — check the Script URL and your connection.`;
+  });
 }
 function lpManualRegisterProject(id){
   const p = listPrepProjects.find(x=>x.id===id);
