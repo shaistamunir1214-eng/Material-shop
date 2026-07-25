@@ -1963,6 +1963,15 @@ function doPost(e) {
 }
 
 function doGet(e) {
+  var ASSIGNMENT_SCRIPT_VERSION = 'v2026-07-26-a'; // bump this whenever the Assignment Script changes —
+    // visiting the Web App URL directly in a browser (no params needed) shows this immediately.
+  if (!e || !e.parameter || !e.parameter.action) {
+    return ContentService.createTextOutput(
+      'Assignment Script is live. Version: ' + ASSIGNMENT_SCRIPT_VERSION +
+      '\n\nThis message means the deployment itself is reachable. To check it has enrollment support, ' +
+      'search this project\'s code (Ctrl+F / Cmd+F) for "enrollPerson" — it should appear multiple times.'
+    ).setMimeType(ContentService.MimeType.TEXT);
+  }
   var p = e.parameter;
   var callback = p.callback;
   var a = p.action;
